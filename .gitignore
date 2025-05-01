@@ -1,0 +1,33 @@
+# Environnements virtuels
+venv/
+ENV/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Fichiers de log et temp
+*.log
+*.tmp
+*.swp
+
+# Variables d'environnement
+.env
+*.env
+
+# VS Code
+.vscode/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Jupyter notebooks (si jamais)
+.ipynb_checkpoints/
+
+# Dossier build (si généré)
+build/
+dist/
