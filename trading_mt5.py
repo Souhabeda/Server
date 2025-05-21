@@ -6,8 +6,6 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 
-
-
 # Charger le .env en haut
 load_dotenv()
 
@@ -20,7 +18,7 @@ MT5_PATH = os.getenv('MT5_PATH')
 RISK_REWARD_RATIO = 1.75
 
 SYMBOL_MAPPING = {
-    "USD": "USD",
+    "GBP": "GBPUSD",
     "AUD": "AUDUSD",
     "EUR": "EURUSD",
     "GOLD": "GOLD",

@@ -84,8 +84,40 @@ def load_and_predict_lstm(df, symbol, timeframe, lookback=10):
     current_price = float(df['Close'].iloc[-1])
 
     trend = "UP" if predicted_price > current_price else "DOWN"
+
+    # Nouvelle prédiction future (sur plusieurs points)
+    future_predictions = []
+    sequence = X[-1]
+    for _ in range(5):  # prédire 5 points futurs
+        pred = model.predict(sequence.reshape(1, lookback, 1), verbose=0)
+        future_predictions.append(float(scaler.inverse_transform(pred)[0][0]))
+        sequence = np.append(sequence[1:], pred, axis=0)
+
+    # Prédiction passée (restaurée depuis les X utilisés)
+    last_points_prediction = [float(scaler.inverse_transform(model.predict(x.reshape(1, lookback, 1), verbose=0))[0][0]) for x in X[-5:]]
+
+    # Bande de fluctuation simple : +/-1% autour de chaque valeur future
+    fluctuation_upper = [round(p * 1.01, 3) for p in future_predictions]
+    fluctuation_lower = [round(p * 0.99, 3) for p in future_predictions]
+
+     # Générer les timestamps futurs pour les fluctuations
+    last_time = df.index[-1]
+    time_interval = df.index[-1] - df.index[-2] if len(df) >= 2 else pd.Timedelta(minutes=1)
+
+    fluctuation_data = []
+    for i in range(5):
+        fluctuation_data.append({
+            "Time": (last_time + (i + 1) * time_interval).strftime('%Y-%m-%d %H:%M:%S'),
+            "Upper": fluctuation_upper[i],
+            "Lower": fluctuation_lower[i]
+        })
     return {
         "current_price": round(current_price, 3),
         "predicted_price": round(predicted_price, 3),
-        "trend": trend
+        "trend": trend,
+        "last_points_prediction": [round(p, 3) for p in last_points_prediction],
+        "lstm_prediction": [round(p, 3) for p in future_predictions],
+        "fluctuation_upper": fluctuation_upper,
+        "fluctuation_lower": fluctuation_lower,
+        "fluctuation_data": fluctuation_data
     }

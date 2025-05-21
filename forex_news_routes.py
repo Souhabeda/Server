@@ -2,6 +2,9 @@
 from flask import Blueprint, jsonify
 from db import forex_news_collection
 from forex_news import job 
+from datetime import datetime, timedelta
+from pymongo import DESCENDING
+
 
 forex_news_bp = Blueprint('forex_news', __name__)
 
@@ -30,8 +33,29 @@ def update_forex_news():
         added = new_count - old_count
 
         return jsonify({
-            "message": f"{added} nouvelles actualités Forex ajoutées.",
+            "message": f"{added} New Forex news added.",
             "added": added
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+# 📣 Route pour récupérer les dernières news ajoutées
+@forex_news_bp.route("/forex-news/new", methods=["GET"])
+def get_new_forex_news():
+    try:
+        # Récupérer les actualités créées dans les dernières 24 heures
+        now = datetime.now()
+        time_threshold = now - timedelta(days=1)  # 24 heures en arrière
+
+        # Convertir `time_threshold` en ISO format pour la comparaison
+        new_news = list(forex_news_collection.find({
+            "created_at": {"$gt": time_threshold}
+        }).sort("created_at", DESCENDING).limit(5))
+
+        for news in new_news:
+            news["_id"] = str(news["_id"])
+
+        return jsonify({"new_forex_news": new_news}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500

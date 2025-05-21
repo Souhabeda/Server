@@ -147,6 +147,8 @@ def job():
             if existing:
                 existing_events_count += 1
             else:
+                # ➕ Ajouter le champ created_at à l'insertion
+                news['created_at'] = datetime.now().isoformat()
                 forex_news_collection.insert_one(news)
                 new_events_count += 1
 

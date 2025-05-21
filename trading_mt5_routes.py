@@ -5,13 +5,14 @@ from trading_mt5 import initialize_mt5, fetch_data_today, calculate_rsi, calcula
 import MetaTrader5 as mt5
 import math
 from lstm_predictor import load_and_predict_lstm
+from utils import save_snapshot, fetch_last_snapshot, is_market_open
 
 routes = Blueprint('routes', __name__)
 
 def is_market_closed(df):
     """ Vérifie si le marché est fermé : uniquement si le DataFrame est vide. """
     return df.empty
-
+    
 @routes.route('/candlestick-data', methods=['POST'])
 def candlestick_data():
     data = request.json
@@ -210,17 +211,6 @@ def market_signal():
         "FVG": latest_fvg if latest_fvg else "No FVG detected"
     })
 
-
-def calculate_tp_sl(signal, entry_price, sl_distance, risk_reward_ratio=2):
-    if signal.lower() == "buy":
-        stop_loss = round(entry_price - sl_distance, 2)
-        take_profit = round(entry_price + sl_distance * risk_reward_ratio, 2)
-    else:  # sell
-        stop_loss = round(entry_price + sl_distance, 2)
-        take_profit = round(entry_price - sl_distance * risk_reward_ratio, 2)
-
-    return stop_loss, take_profit
-
 @routes.route('/full-analysis', methods=['POST'])
 def full_analysis():
     data = request.json
@@ -244,21 +234,32 @@ def full_analysis():
         mt5.shutdown()
         return jsonify({"error": "Symbole invalide."}), 400
 
+    # Essayer de récupérer les données d'aujourd'hui
     df = fetch_data_today(mapped_symbol, timeframe_code)
     mt5.shutdown()
 
-    if df.empty:
+    # Si pas de données ou marché fermé → snapshot
+    if df.empty or not is_market_open():
+        last_snapshot = fetch_last_snapshot(mapped_symbol, timeframe, indicator)
+        if last_snapshot is None:
+            return jsonify({
+                "market_status": "closed",
+                "message": "Market is closed. Displaying last available data and prediction."
+            }), 403
+
         return jsonify({
             "market_status": "closed",
-            "message": "Marché fermé ou pas de données."
-        }), 403
+            "candles": last_snapshot['candle_data'],
+            "indicator_value": last_snapshot['indicator_value'],
+            "trend": last_snapshot['trend'],
+            "signal_info": last_snapshot['signal_info']
+        })
 
-    # Candlestick Data
+    # Si des données et marché ouvert → calculs en live
     candles = df[['Open', 'High', 'Low', 'Close']].copy()
     candles['Time'] = df.index.strftime('%Y-%m-%d %H:%M:%S')
     candle_data = candles.to_dict(orient='records')
 
-    # Indicator Data
     last_value = None
     trend = "Neutral"
     signal_info = None
@@ -266,10 +267,8 @@ def full_analysis():
     if indicator.upper() == "RSI":
         calculate_rsi(df)
         last_value = round(df['RSI'].iloc[-1], 2)
-
         if math.isnan(last_value):
             last_value = None
-
         if last_value is not None:
             if last_value < 30:
                 trend = "Bullish"
@@ -292,12 +291,10 @@ def full_analysis():
         calculate_macd(df)
         last_macd = round(df["MACD"].iloc[-1], 5)
         last_signal = round(df["MACD_Signal"].iloc[-1], 5)
-
         if math.isnan(last_macd):
             last_macd = None
         if math.isnan(last_signal):
             last_signal = None
-
         if last_macd is not None and last_signal is not None:
             trend = "Bullish" if last_macd > last_signal else "Bearish"
             signal_info = {
@@ -306,25 +303,26 @@ def full_analysis():
                 "entry": df['Close'].iloc[-1],
                 "sl": 0.5,
             }
-
         last_value = last_macd
 
     else:
         return jsonify({"error": "Indicateur non supporté."}), 400
 
-    # Calcul du Stop Loss et Take Profit
     if signal_info:
         sl, tp = calculate_tp_sl(signal_info['signal'], signal_info['entry'], signal_info['sl'], risk_reward_ratio=2)
         signal_info['stop_loss'] = sl
         signal_info['take_profit'] = tp
 
+    # Sauvegarder le snapshot live
+    save_snapshot(mapped_symbol, timeframe, indicator, candle_data, last_value, trend, signal_info)
+
     return jsonify({
+        "market_status": "open",
         "candles": candle_data,
         "indicator_value": last_value,
         "trend": trend,
         "signal_info": signal_info
     })
-
 
 @routes.route('/settings', methods=['GET'])
 def get_settings():
@@ -333,8 +331,6 @@ def get_settings():
         "timeframes": list(TIMEFRAME_MAPPING.keys()),
         "indicators": INDICATORS
     })
-
-
 @routes.route('/lstm-prediction', methods=['POST'])
 def lstm_prediction():
     print("Requête reçue /lstm-prediction")
@@ -363,12 +359,170 @@ def lstm_prediction():
 
     mt5.shutdown()
 
-    # Modification ici : Accepter moins de données pour la prédiction, comme 5 au lieu de 15
     if df.empty or len(df) < 5:
         return jsonify({"error": "Pas assez de données pour la prédiction."}), 403
 
     result = load_and_predict_lstm(df, symbol, timeframe)
-    result['indicator'] = indicator  # Ajout de l'indicateur dans la réponse
+    predicted_price = result.get("predicted_price", 0)
+    current_price = result.get("current_price", 0)
+    trend = result.get("trend", "UNKNOWN")
 
-    print("Résultat de la prédiction:", result)
-    return jsonify(result)
+    # Derniers points d'entrée utilisés par le modèle (prédiction passée)
+    last_points_prediction = df[['Close']].tail(10).copy()
+    last_points_prediction['Time'] = df.index[-10:].strftime('%Y-%m-%d %H:%M:%S')
+    last_points_prediction = last_points_prediction.to_dict(orient='records')
+
+    # Bougies OHLC + Time
+    candles = df[['Open', 'High', 'Low', 'Close']].copy()
+    candles['Time'] = df.index.strftime('%Y-%m-%d %H:%M:%S')
+    candles = candles.to_dict(orient='records')
+
+    # Bande de fluctuation (±1% autour de la prédiction)
+    fluctuation_range = 0.01 * predicted_price
+    fluctuation_upper = round(predicted_price + fluctuation_range, 3)
+    fluctuation_lower = round(predicted_price - fluctuation_range, 3)
+
+    # Réponse finale
+    response = {
+        "current_price": current_price,
+        "predicted_price": predicted_price,
+        "trend": trend,
+        "indicator": indicator,
+        "candles": candles,
+        "last_points_prediction": last_points_prediction,
+        "lstm_prediction": predicted_price,
+        "fluctuation_upper": fluctuation_upper,
+        "fluctuation_lower": fluctuation_lower
+    }
+
+    print("Résultat de la prédiction enrichie:", response)
+    return jsonify(response)
+
+
+@routes.route('/full-lstm-analysis', methods=['POST'])
+def full_lstm_analysis():
+    data = request.json
+    symbol = data.get('symbol')
+    timeframe = data.get('timeframe')
+    indicator = data.get('indicator')
+
+    if not symbol or not timeframe or not indicator:
+        return jsonify({"error": "Tous les champs sont requis."}), 400
+
+    if not initialize_mt5():
+        return jsonify({"error": "Connexion MT5 impossible."}), 500
+
+    timeframe_code = TIMEFRAME_MAPPING.get(timeframe)
+    mapped_symbol = SYMBOL_MAPPING.get(symbol)
+
+    if not timeframe_code or not mapped_symbol:
+        mt5.shutdown()
+        return jsonify({"error": "Symbole ou timeframe invalide."}), 400
+
+    df = fetch_data_today(mapped_symbol, timeframe_code)
+    mt5.shutdown()
+
+    # Fallback si marché fermé
+    if df.empty or not is_market_open():
+        last_snapshot = fetch_last_snapshot(mapped_symbol, timeframe, indicator)
+        if last_snapshot is None:
+            return jsonify({
+                "market_status": "closed",
+                "message": "Market is closed. Displaying last available data and prediction."
+            }), 403
+
+        return jsonify({
+            "market_status": "closed",
+            "candles": last_snapshot['candle_data'],
+            "indicator_value": last_snapshot['indicator_value'],
+            "trend": last_snapshot['trend'],
+            "signal_info": last_snapshot['signal_info']
+        })
+
+    # === Données bougies ===
+    candles = df[['Open', 'High', 'Low', 'Close']].copy()
+    candles['Time'] = df.index.strftime('%Y-%m-%d %H:%M:%S')
+    candle_data = candles.to_dict(orient='records')
+
+    # === Calcul de l'indicateur ===
+    last_value = None
+    trend = "Neutral"
+    signal_info = None
+
+    if indicator.upper() == "RSI":
+        calculate_rsi(df)
+        last_value = round(df['RSI'].iloc[-1], 2)
+        if not math.isnan(last_value):
+            if last_value < 30:
+                trend = "Bullish"
+                signal_info = {
+                    "signal": "Buy",
+                    "timestamp": df.index[-1],
+                    "entry": df['Close'].iloc[-1],
+                    "sl": 0.5,
+                }
+            elif last_value > 70:
+                trend = "Bearish"
+                signal_info = {
+                    "signal": "Sell",
+                    "timestamp": df.index[-1],
+                    "entry": df['Close'].iloc[-1],
+                    "sl": 0.5,
+                }
+
+    elif indicator.upper() == "MACD":
+        calculate_macd(df)
+        last_macd = round(df["MACD"].iloc[-1], 5)
+        last_signal = round(df["MACD_Signal"].iloc[-1], 5)
+        if not math.isnan(last_macd) and not math.isnan(last_signal):
+            trend = "Bullish" if last_macd > last_signal else "Bearish"
+            signal_info = {
+                "signal": "Buy" if last_macd > last_signal else "Sell",
+                "timestamp": df.index[-1],
+                "entry": df['Close'].iloc[-1],
+                "sl": 0.5,
+            }
+            last_value = last_macd
+    else:
+        return jsonify({"error": "Indicateur non supporté."}), 400
+
+    if signal_info:
+        sl, tp = calculate_tp_sl(signal_info['signal'], signal_info['entry'], signal_info['sl'], risk_reward_ratio=2)
+        signal_info['stop_loss'] = sl
+        signal_info['take_profit'] = tp
+
+    # === Prédiction LSTM ===
+    if len(df) < 5:
+        return jsonify({"error": "Pas assez de données pour la prédiction."}), 403
+
+    result = load_and_predict_lstm(df, symbol, timeframe)
+    predicted_price = result.get("predicted_price", 0)
+    current_price = result.get("current_price", 0)
+    lstm_trend = result.get("trend", "UNKNOWN")
+
+    last_points_prediction = df[['Close']].tail(10).copy()
+    last_points_prediction['Time'] = df.index[-10:].strftime('%Y-%m-%d %H:%M:%S')
+    last_points_prediction = last_points_prediction.to_dict(orient='records')
+
+    fluctuation_range = 0.01 * predicted_price
+    fluctuation_upper = round(predicted_price + fluctuation_range, 3)
+    fluctuation_lower = round(predicted_price - fluctuation_range, 3)
+
+    # === Snapshot (optionnel) ===
+    save_snapshot(mapped_symbol, timeframe, indicator, candle_data, last_value, trend, signal_info)
+
+    return jsonify({
+        "candles": candle_data,
+        "indicator": indicator,
+        "indicator_value": last_value,
+        "indicator_trend": trend,
+        "signal_info": signal_info,
+        "lstm_prediction": {
+            "current_price": current_price,
+            "predicted_price": predicted_price,
+            "trend": lstm_trend,
+            "last_points_prediction": last_points_prediction,
+            "fluctuation_data": result.get("fluctuation_data", [])
+
+        }
+    })
